@@ -180,6 +180,8 @@ function speechGate(rmsValues) {
  * Analyzes raw PCM data to detect AI markers using spectral and statistical features.
  */
 function runDetection(data, sampleRate) {
+  const detectorVersion = 'v3';
+
   const duration = data.length / sampleRate;
   if (duration < 2.0) {
     return { verdict: 'ERROR', score: 0, aiProbability: 0, details: 'Audio too short for reliable analysis (minimum 2 seconds)' };
@@ -276,11 +278,15 @@ function runDetection(data, sampleRate) {
     fluxStability: clamp01((fluxCV - 0.41) / 0.05),
   };
 
+  /* v3 weights: flux / flatStability get low weight — on phone recordings
+     (Voice Memos DSP, AAC) they fire for real human voices. The main
+     load is carried by loudness dynamics (energyJitter, phraseFlat) and
+     the regularity of spectral transitions (fluxStability). */
   const weights = {
-    flux: 0.15,
-    flatStability: 0.25,
-    energyJitter: 0.20,
-    phraseFlat: 0.10,
+    flux: 0.10,
+    flatStability: 0.10,
+    energyJitter: 0.30,
+    phraseFlat: 0.20,
     fluxStability: 0.30,
   };
 
@@ -309,7 +315,8 @@ function runDetection(data, sampleRate) {
     score: finalScore,
     aiProbability,
     details,
-    features: { energyCV, energyCVLong, fluxMean, fluxCV, bandFlatCV },
+    detectorVersion,
+    features: { energyCV, energyCVLong, fluxMean, fluxCV, bandFlatCV, sampleRate },
     subScores,
   };
 }

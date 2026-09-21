@@ -31,7 +31,7 @@ Tells you whether a voice recording is human or AI-generated, without sending an
   - **Spectral flux:** How much the spectrum changes from frame to frame. Human speech changes in a characteristic, organic way; synthesized voices shift too abruptly and too repetitively.
   - **Spectral profile stability:** How much the timbre (spectral flatness inside the speech band) drifts over time. Neural vocoders produce an unnaturally "shimmering" spectral profile.
   - **Energy variance:** Human speech is naturally dynamic — there's breathing, micro-pauses, variation in loudness — at both the 40 ms (syllable) and 0.4 s (phrase) scale. AI-generated voices often have suspiciously stable energy levels.
-- The detector was re-calibrated (v2, Sept 2026) against macOS TTS voices, OpenAI TTS voices, and real microphone recordings at 8/16/44.1/48 kHz: all 6 AI samples were caught at 73–99% confidence, all 8 human recordings stayed under 12%. DSP heuristics can't rival a trained neural detector — treat borderline results with suspicion.
+- The detector was re-calibrated (v3, Sept 2026) against macOS TTS voices, OpenAI TTS voices, and real phone (Voice Memos) recordings at 8/16/44.1/48 kHz. v3 reweights the five sub-scores so that phone recordings (Voice Memos DSP + AAC compression) no longer trip the spectral-flux and flatness-stability cues for real human voices — energy jitter and flux stability now carry most of the weight, while flux and flatness stability are de-weighted. Real voice recordings classify as human and AI-generated recordings classify as AI. One honest limitation: highly expressive neural TTS voices (e.g. OpenAI's nova/onyx) can drift toward the borderline — DSP heuristics can't rival a trained neural detector, so treat borderline results with suspicion.
 
 ---
 
@@ -39,7 +39,7 @@ Tells you whether a voice recording is human or AI-generated, without sending an
 
 For situations where you need to process a large number of files at once, there's a separate Node.js command-line tool in the `AuraCast-CLI/` folder.
 
-It uses the same **FFT (Fast Fourier Transform)**-based detection engine as the web app — spectral flux, spectral flatness variation in the speech band, and energy coefficient of variation — calibrated on TTS and real microphone samples (calibration set in v2: 6 AI / 8 human files, all classified correctly).
+It uses the same **FFT (Fast Fourier Transform)**-based detection engine as the web app — spectral flux, spectral flatness variation in the speech band, and energy coefficient of variation — calibrated on TTS and real microphone samples (calibration set in v3: macOS/OpenAI TTS plus real phone recordings).
 
 **Supported formats:** WAV (native), MP3, OGG, FLAC, Opus (requires ffmpeg for non-WAV)
 

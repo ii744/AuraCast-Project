@@ -256,11 +256,15 @@ function runDetection(data, sampleRate) {
     fluxStability: clamp01((fluxCV - 0.41) / 0.05),
   };
 
+  /* v3 weights: flux / flatStability get low weight — on phone recordings
+     (Voice Memos DSP, AAC) they fire for real human voices. The main
+     load is carried by loudness dynamics (energyJitter, phraseFlat) and
+     the regularity of spectral transitions (fluxStability). */
   const weights = {
-    flux: 0.15,
-    flatStability: 0.25,
-    energyJitter: 0.20,
-    phraseFlat: 0.10,
+    flux: 0.10,
+    flatStability: 0.10,
+    energyJitter: 0.30,
+    phraseFlat: 0.20,
     fluxStability: 0.30,
   };
 
