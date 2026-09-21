@@ -26,11 +26,12 @@ Prevents AI models from parsing or cloning your voice.
 ### 2. AI Voice Detection — Deepfake Scanner
 Tells you whether a voice recording is human or AI-generated, without sending anything to a server.
 
-- **How it works:** The scanner uses Digital Signal Processing (DSP) heuristics to analyze the audio signal directly.
+- **How it works:** The scanner uses Digital Signal Processing (DSP) heuristics to analyze the audio signal directly, working on 40 ms frames inside the speech band (50–4000 Hz), so results don't depend on the file's sample rate.
 - **What it looks for:**
-  - **Energy variance:** Human speech is naturally dynamic — there's breathing, micro-pauses, variation in loudness. AI-generated voices often have suspiciously stable energy levels.
-  - **Zero-Crossing Rate (ZCR):** Measures how often the audio signal crosses zero. Unnatural patterns here can indicate digital artifacts from vocoders or synthesis pipelines.
-  - **Silence detection:** Real microphones always pick up some background noise. Mathematically perfect silence (`0.0000` amplitude) between words is a red flag that often points to AI generation.
+  - **Spectral flux:** How much the spectrum changes from frame to frame. Human speech changes in a characteristic, organic way; synthesized voices shift too abruptly and too repetitively.
+  - **Spectral profile stability:** How much the timbre (spectral flatness inside the speech band) drifts over time. Neural vocoders produce an unnaturally "shimmering" spectral profile.
+  - **Energy variance:** Human speech is naturally dynamic — there's breathing, micro-pauses, variation in loudness — at both the 40 ms (syllable) and 0.4 s (phrase) scale. AI-generated voices often have suspiciously stable energy levels.
+- The detector was re-calibrated (v2, Sept 2026) against macOS TTS voices, OpenAI TTS voices, and real microphone recordings at 8/16/44.1/48 kHz: all 6 AI samples were caught at 73–99% confidence, all 8 human recordings stayed under 12%. DSP heuristics can't rival a trained neural detector — treat borderline results with suspicion.
 
 ---
 
@@ -38,7 +39,7 @@ Tells you whether a voice recording is human or AI-generated, without sending an
 
 For situations where you need to process a large number of files at once, there's a separate Node.js command-line tool in the `AuraCast-CLI/` folder.
 
-It uses a more sophisticated detection engine based on **FFT (Fast Fourier Transform)** and spectral analysis — including spectral flatness, centroid variance, and energy coefficient of variation. The algorithm was calibrated and validated against a 100-file test dataset.
+It uses the same **FFT (Fast Fourier Transform)**-based detection engine as the web app — spectral flux, spectral flatness variation in the speech band, and energy coefficient of variation — calibrated on TTS and real microphone samples (calibration set in v2: 6 AI / 8 human files, all classified correctly).
 
 **Supported formats:** WAV (native), MP3, OGG, FLAC, Opus (requires ffmpeg for non-WAV)
 

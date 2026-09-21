@@ -33,7 +33,9 @@ const COLORS = {
 };
 
 const SUPPORTED_EXTENSIONS = new Set(['.wav', '.mp3', '.ogg', '.flac', '.oga', '.opus']);
-const ANALYSIS_WINDOW_SECONDS = 0.4;
+const FRAME_SECONDS = 0.04;
+const LONG_WINDOW_SECONDS = 0.4;
+const AI_THRESHOLD = 0.35;
 
 const args = process.argv.slice(2);
 const isVerbose = args.includes('--verbose') || args.includes('-v');
@@ -94,6 +96,66 @@ function performFFT(real, imag) {
   }
 }
 
+/* Detection Algorithm v2 — identical to the web app (script.js).
+ *
+ * v1 defects fixed here:
+ * 1) Speech gate used p10*3 of block RMS — for continuous speech the
+ *    threshold rose ABOVE the signal and the analyzer returned
+ *    "insufficient speech" (or silently dropped most of the audio).
+ * 2) Spectral flatness skipped FFT bins below 1e-10 — silence-like
+ *    frequency bands (resampled / band-limited files, e.g. mp3 with a
+ *    16 kHz cutoff in a 44.1 kHz container) were excluded, so a HUMAN
+ *    voice read as "extremely low flatness" and got flagged as AI.
+ * 3) The score was a weighted sum of capped sub-scores that could
+ *    never reach 1.0, then shown to the user as "% AI".
+ *
+ * v2 features (sample-rate invariant):
+ *   fluxMean / fluxCV  — spectral change between adjacent 40 ms frames
+ *                        (50–4000 Hz band, normalized)
+ *   bandFlatCV         — variation of spectral flatness in speech band
+ *   energyCV           — loudness variation of 40 ms speech frames
+ *   energyCVLong       — loudness variation of 0.4 s blocks
+ * Verdict threshold 0.35; aiProbability = logistic(score) for display.
+ */
+
+function clamp01(x) {
+  return Math.min(Math.max(x, 0), 1);
+}
+
+function median(sortedArr) {
+  const n = sortedArr.length;
+  if (!n) return 0;
+  const mid = Math.floor(n / 2);
+  return n % 2 ? sortedArr[mid] : (sortedArr[mid - 1] + sortedArr[mid]) / 2;
+}
+
+function nextPow2(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+/* RMS for non-overlapping windows of `win` samples */
+function windowRms(data, win) {
+  const count = Math.floor(data.length / win);
+  const rms = new Float64Array(count);
+  for (let w = 0; w < count; w++) {
+    let sum = 0;
+    const base = w * win;
+    for (let i = 0; i < win; i++) sum += data[base + i] * data[base + i];
+    rms[w] = Math.sqrt(sum / win);
+  }
+  return rms;
+}
+
+/* Fixed speech gate: works for continuous speech (v1 failed there) */
+function speechGate(rmsValues) {
+  const sorted = Array.from(rmsValues).sort((a, b) => a - b);
+  const p10 = sorted[Math.floor(sorted.length * 0.1)];
+  const med = median(sorted);
+  return Math.max(0.003, Math.min(p10 * 2, med * 0.45));
+}
+
 /**
  * Analyzes audio data to detect AI generation markers.
  * @param {Float32Array} data - Raw audio samples
@@ -102,171 +164,143 @@ function performFFT(real, imag) {
  */
 function runDetection(data, sampleRate) {
   const duration = data.length / sampleRate;
-  const windowSize = Math.floor(sampleRate * ANALYSIS_WINDOW_SECONDS);
 
-  const blocks = [];
-  for (let i = 0; i < data.length; i += windowSize) {
-    const end = Math.min(i + windowSize, data.length);
-    const chunk = data.subarray(i, end);
-    if (chunk.length < windowSize * 0.5) continue;
-
-    let zeroCrossings = 0;
-    let sumSquares = 0;
-    let peakAmplitude = 0;
-    let nearZeroSamples = 0;
-
-    for (let j = 0; j < chunk.length; j++) {
-      const val = chunk[j];
-      const absVal = Math.abs(val);
-      sumSquares += val * val;
-      if (absVal > peakAmplitude) peakAmplitude = absVal;
-      if (absVal < 0.0001) nearZeroSamples++;
-      if (j > 0 && ((chunk[j - 1] > 0 && val <= 0) || (chunk[j - 1] < 0 && val >= 0))) {
-        zeroCrossings++;
-      }
-    }
-
-    blocks.push({
-      rms: Math.sqrt(sumSquares / chunk.length),
-      zcr: zeroCrossings * (sampleRate / chunk.length),
-      peak: peakAmplitude,
-      nzr: nearZeroSamples / chunk.length,
-    });
+  if (duration < 2.0) {
+    return createResult('ERROR', 0, 0, duration, 'Audio segment too short for reliable analysis (minimum 2 seconds)', {});
   }
 
-  if (blocks.length < 5) {
-    return createResult('HUMAN', 0, duration, 'Audio segment too short for reliable analysis', {});
+  const frameSamples = Math.max(64, Math.round(sampleRate * FRAME_SECONDS));
+  const frameRms = windowRms(data, frameSamples);
+  const speechThreshold = speechGate(frameRms);
+  const isSpeech = Array.from(frameRms, v => v > speechThreshold);
+  const speechCount = isSpeech.filter(Boolean).length;
+
+  if (speechCount < 5) {
+    return createResult('ERROR', 0, 0, duration, 'Insufficient speech content detected', {});
   }
 
-  const sortedRms = blocks.map(b => b.rms).sort((a, b) => a - b);
-  const p10 = sortedRms[Math.floor(sortedRms.length * 0.1)];
-  const speechThreshold = Math.max(p10 * 3, 0.003);
-  const speechBlocks = blocks.filter(b => b.rms > speechThreshold);
+  const speechRms = Array.from(frameRms).filter((_, i) => isSpeech[i]);
+  const energyCV = calculateCV(speechRms);
 
-  if (speechBlocks.length < 3) {
-    return createResult('HUMAN', 0, duration, 'Insufficient speech content detected', {});
+  const longSamples = Math.round(sampleRate * LONG_WINDOW_SECONDS);
+  const longRms = windowRms(data, longSamples);
+  const longSpeechValues = Array.from(longRms).filter(v => v > speechThreshold);
+  const energyCVLong = longSpeechValues.length >= 3 ? calculateCV(longSpeechValues) : null;
+
+  const fftSize = nextPow2(frameSamples);
+  const binHz = sampleRate / fftSize;
+  const loBin = Math.max(1, Math.floor(50 / binHz));
+  const hiBin = Math.min(fftSize / 2 - 1, Math.floor(4000 / binHz));
+  const bandBins = hiBin - loBin + 1;
+
+  const real = new Float64Array(fftSize);
+  const imag = new Float64Array(fftSize);
+  const hann = new Float64Array(frameSamples);
+  for (let i = 0; i < frameSamples; i++) {
+    hann[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (frameSamples - 1));
   }
 
-  const speechRmsValues = speechBlocks.map(b => b.rms);
-  const speechZcrValues = speechBlocks.map(b => b.zcr);
-  const speechCrestFactors = speechBlocks.map(b => b.rms > 0 ? b.peak / b.rms : 0);
-
-  const energyCV = calculateCV(speechRmsValues);
-  const zcrCV = calculateCV(speechZcrValues);
-  const crestCV = calculateCV(speechCrestFactors);
-
-  let jumpSum = 0;
-  for (let i = 1; i < blocks.length; i++) {
-    jumpSum += Math.abs(blocks[i].rms - blocks[i - 1].rms);
-  }
-  const meanRms = calculateMean(speechRmsValues);
-  const dynamics = meanRms > 0 ? (jumpSum / (blocks.length - 1)) / meanRms : 0;
-
-  const FFT_SIZE = 2048;
-  const centroids = [];
+  const bandMagnitudes = [];
   const flatnesses = [];
-  const hfRatios = [];
 
-  for (let start = 0; start < data.length - FFT_SIZE; start += FFT_SIZE) {
-    let frameSumSquares = 0;
-    for (let i = 0; i < FFT_SIZE; i++) frameSumSquares += data[start + i] * data[start + i];
-    if (Math.sqrt(frameSumSquares / FFT_SIZE) < speechThreshold) continue;
+  for (let f = 0; f < frameRms.length; f++) {
+    if (!isSpeech[f]) continue;
 
-    const real = new Float64Array(FFT_SIZE);
-    const imag = new Float64Array(FFT_SIZE);
-    for (let i = 0; i < FFT_SIZE; i++) {
-      const hann = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (FFT_SIZE - 1));
-      real[i] = data[start + i] * hann;
+    real.fill(0);
+    imag.fill(0);
+    const base = f * frameSamples;
+    for (let i = 0; i < frameSamples; i++) {
+      real[i] = data[base + i] * hann[i];
     }
     performFFT(real, imag);
 
-    const halfSize = FFT_SIZE / 2;
-    const magnitude = new Float64Array(halfSize);
-    for (let k = 0; k < halfSize; k++) {
-      magnitude[k] = Math.sqrt(real[k] * real[k] + imag[k] * imag[k]);
+    const mag = new Float64Array(bandBins);
+    let sum = 0;
+    for (let k = loBin; k <= hiBin; k++) {
+      const m = Math.sqrt(real[k] * real[k] + imag[k] * imag[k]);
+      mag[k - loBin] = m;
+      sum += m;
     }
-
-    let sumMag = 0;
-    let sumWeightedMag = 0;
-    for (let k = 0; k < halfSize; k++) {
-      const freq = k * sampleRate / FFT_SIZE;
-      sumWeightedMag += freq * magnitude[k];
-      sumMag += magnitude[k];
+    if (sum > 0) {
+      const normed = new Float64Array(bandBins);
+      for (let i = 0; i < bandBins; i++) normed[i] = mag[i] / sum;
+      bandMagnitudes.push(normed);
     }
-    if (sumMag > 0) centroids.push(sumWeightedMag / sumMag);
 
     let logSum = 0;
-    let linearSum = 0;
-    let binCount = 0;
-    for (let k = 1; k < halfSize; k++) {
-      if (magnitude[k] > 1e-10) {
-        logSum += Math.log(magnitude[k]);
-        linearSum += magnitude[k];
-        binCount++;
-      }
-    }
-    if (binCount > 0 && linearSum > 0) {
-      flatnesses.push(Math.exp(logSum / binCount) / (linearSum / binCount));
-    }
-
-    const bin4k = Math.floor(4000 * FFT_SIZE / sampleRate);
-    let lowEnergy = 0;
-    let highEnergy = 0;
-    for (let k = 0; k < halfSize; k++) {
-      const energy = magnitude[k] * magnitude[k];
-      if (k < bin4k) lowEnergy += energy;
-      else highEnergy += energy;
-    }
-    if (lowEnergy + highEnergy > 0) hfRatios.push(highEnergy / (lowEnergy + highEnergy));
+    for (let i = 0; i < bandBins; i++) logSum += Math.log(mag[i] + 1e-12);
+    flatnesses.push(Math.exp(logSum / bandBins) / (sum / bandBins + 1e-12));
   }
 
-  const centroidCV = centroids.length > 1 ? calculateCV(centroids) : 0.5;
-  const flatnessMean = calculateMean(flatnesses);
-  const flatnessCV = flatnesses.length > 1 ? calculateCV(flatnesses) : 0.5;
-  const hfMean = calculateMean(hfRatios);
+  const fluxes = [];
+  for (let i = 1; i < bandMagnitudes.length; i++) {
+    let diffSum = 0;
+    const cur = bandMagnitudes[i];
+    const prev = bandMagnitudes[i - 1];
+    for (let j = 0; j < bandBins; j++) {
+      const d = cur[j] - prev[j];
+      diffSum += d * d;
+    }
+    fluxes.push(Math.sqrt(diffSum));
+  }
 
-  const features = { energyCV, zcrCV, crestCV, dynamics, centroidCV, flatnessMean, flatnessCV, hfMean };
+  const fluxMean = calculateMean(fluxes);
+  const fluxCV = fluxes.length > 1 ? calculateCV(fluxes) : 0.5;
+  const bandFlatCV = flatnesses.length > 1 ? calculateCV(flatnesses) : 0.5;
 
   const subScores = {
-    lowFlatness: 1 - Math.min(Math.max(flatnessMean / 0.035, 0), 1),
-    stableFlatness: 1 - Math.min(Math.max(flatnessCV / 0.70, 0), 1),
-    energyFlat: 1 - Math.min(Math.max(energyCV / 0.55, 0), 1),
+    flux: clamp01((fluxMean - 0.133) / 0.035),
+    flatStability: clamp01((bandFlatCV - 0.55) / 0.20),
+    energyJitter: clamp01((0.70 - energyCV) / 0.25),
+    phraseFlat: energyCVLong === null ? 0.5 : clamp01((0.28 - energyCVLong) / 0.16),
+    fluxStability: clamp01((fluxCV - 0.41) / 0.05),
   };
 
   const weights = {
-    lowFlatness: 0.50,
-    stableFlatness: 0.20,
-    energyFlat: 0.30,
+    flux: 0.15,
+    flatStability: 0.25,
+    energyJitter: 0.20,
+    phraseFlat: 0.10,
+    fluxStability: 0.30,
   };
 
   let finalScore = 0;
   for (const [key, weight] of Object.entries(weights)) {
-    finalScore += (subScores[key] || 0) * weight;
+    finalScore += subScores[key] * weight;
   }
 
-  const verdict = finalScore > 0.30 ? 'AI' : 'HUMAN';
+  const verdict = finalScore >= AI_THRESHOLD ? 'AI' : 'HUMAN';
+  const aiProbability = 1 / (1 + Math.exp(-(finalScore - AI_THRESHOLD) * 12));
 
   const indicators = [];
-  if (subScores.lowFlatness > 0.4) indicators.push('low spectral flatness');
-  if (subScores.stableFlatness > 0.4) indicators.push('uniform spectral profile');
-  if (subScores.energyFlat > 0.4) indicators.push('flat energy');
-  const details = indicators.length > 0 ? indicators.join(', ') : 'Authentic speech patterns';
+  if (subScores.flux > 0.4) indicators.push('unnaturally rapid spectral change');
+  if (subScores.flatStability > 0.4) indicators.push('unstable spectral profile');
+  if (subScores.energyJitter > 0.4) indicators.push('overly uniform loudness');
+  if (subScores.phraseFlat > 0.4) indicators.push('phrase-level energy too even');
+  if (subScores.fluxStability > 0.4) indicators.push('repetitive spectral transitions');
 
-  return createResult(verdict, finalScore, duration, details, features, subScores, speechBlocks.length);
+  let details = indicators.length > 0 ? indicators.join(', ') : 'Authentic speech patterns';
+  if (finalScore > 0.25 && finalScore < 0.50) {
+    details += ' (low certainty — short or borderline sample)';
+  }
+
+  const features = { energyCV, energyCVLong, fluxMean, fluxCV, bandFlatCV };
+  return createResult(verdict, finalScore, aiProbability, duration, details, features, subScores, speechCount);
 }
 
 /**
  * Creates a standardized result object.
  */
-function createResult(verdict, score, duration, details, features, scores, speechBlocks) {
+function createResult(verdict, score, aiProbability, duration, details, features, scores, speechFrames) {
   return {
     verdict,
     score,
+    aiProbability,
     duration,
     details,
     features,
     scores: scores || {},
-    totalSpeechBlocks: speechBlocks || 0,
+    totalSpeechFrames: speechFrames || 0,
   };
 }
 
@@ -455,16 +489,23 @@ function main() {
       result.file = relativeName;
       results.push(result);
 
-      const label = result.verdict === 'AI'
-        ? `${COLORS.bgRed}${COLORS.white}${COLORS.bold} AI ${COLORS.reset}`
-        : `${COLORS.bgGreen}${COLORS.white}${COLORS.bold} HUMAN ${COLORS.reset}`;
+      let label;
+      if (result.verdict === 'AI') {
+        label = `${COLORS.bgRed}${COLORS.white}${COLORS.bold} AI ${COLORS.reset}`;
+      } else if (result.verdict === 'HUMAN') {
+        label = `${COLORS.bgGreen}${COLORS.white}${COLORS.bold} HUMAN ${COLORS.reset}`;
+      } else {
+        label = `${COLORS.bgYellow}${COLORS.white}${COLORS.bold} ERROR ${COLORS.reset}`;
+      }
 
-      console.log(`${label} ${COLORS.dim}(${(result.score * 100).toFixed(1)}%)${COLORS.reset}`);
+      const pct = result.verdict === 'ERROR' ? '—' : `${(result.aiProbability * 100).toFixed(1)}%`;
+      console.log(`${label} ${COLORS.dim}(${pct})${COLORS.reset}`);
 
       if (isVerbose && result.features) {
         const { features: f, scores: s } = result;
-        console.log(`    ${COLORS.dim}Features: flatMean=${f.flatnessMean?.toFixed(4)} flatCV=${f.flatnessCV?.toFixed(3)} eCV=${f.energyCV?.toFixed(3)} zCV=${f.zcrCV?.toFixed(3)}`);
-        console.log(`    Scores:   lowFlat=${s.lowFlatness?.toFixed(2)} stableFlat=${s.stableFlatness?.toFixed(2)} eFlat=${s.energyFlat?.toFixed(2)} → total=${result.score.toFixed(3)}${COLORS.reset}`);
+        const fLong = f.energyCVLong === null ? 'n/a' : f.energyCVLong.toFixed(3);
+        console.log(`    ${COLORS.dim}Features: fluxMean=${f.fluxMean?.toFixed(3)} fluxCV=${f.fluxCV?.toFixed(3)} flatCV=${f.bandFlatCV?.toFixed(3)} eCV=${f.energyCV?.toFixed(3)} eCVlong=${fLong}`);
+        console.log(`    Scores:   flux=${s.flux?.toFixed(2)} flatStab=${s.flatStability?.toFixed(2)} eJitter=${s.energyJitter?.toFixed(2)} phraseFlat=${s.phraseFlat?.toFixed(2)} fluxStab=${s.fluxStability?.toFixed(2)} → total=${result.score.toFixed(3)}${COLORS.reset}`);
       }
     } catch (err) {
       console.log(`${COLORS.red}ERROR: ${err.message}${COLORS.reset}`);
@@ -490,7 +531,7 @@ function displayTable(results) {
   console.log(`${COLORS.dim}${separator}${COLORS.reset}`);
 
   for (const r of results) {
-    const scoreText = r.verdict === 'ERROR' ? '—' : `${(r.score * 100).toFixed(1)}%`;
+    const scoreText = r.verdict === 'ERROR' ? '—' : `${((r.aiProbability ?? r.score) * 100).toFixed(1)}%`;
     const durationText = r.duration ? formatDuration(r.duration) : '—';
     const detailText = (r.details || r.error || '').substring(0, 40);
 
@@ -554,6 +595,7 @@ function exportReport(results, basePath) {
       file: r.file,
       verdict: r.verdict,
       score: r.score,
+      aiProbability: r.aiProbability,
       duration: r.duration,
       details: r.details,
       features: r.features,
