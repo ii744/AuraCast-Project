@@ -298,14 +298,27 @@ function runDetection(data, sampleRate) {
   const verdict = finalScore >= AI_THRESHOLD ? 'AI' : 'HUMAN';
   const aiProbability = 1 / (1 + Math.exp(-(finalScore - AI_THRESHOLD) * 12));
 
-  const indicators = [];
-  if (subScores.flux > 0.4) indicators.push('unnaturally rapid spectral change');
-  if (subScores.flatStability > 0.4) indicators.push('unstable spectral profile');
-  if (subScores.energyJitter > 0.4) indicators.push('overly uniform loudness');
-  if (subScores.phraseFlat > 0.4) indicators.push('phrase-level energy too even');
-  if (subScores.fluxStability > 0.4) indicators.push('repetitive spectral transitions');
+  const aiIndicators = [];
+  if (subScores.flux > 0.4) aiIndicators.push('unnaturally rapid spectral change');
+  if (subScores.flatStability > 0.4) aiIndicators.push('unstable spectral profile');
+  if (subScores.energyJitter > 0.4) aiIndicators.push('overly uniform loudness');
+  if (subScores.phraseFlat > 0.4) aiIndicators.push('phrase-level energy too even');
+  if (subScores.fluxStability > 0.4) aiIndicators.push('repetitive spectral transitions');
 
-  let details = indicators.length > 0 ? indicators.join(', ') : 'Authentic speech patterns';
+  const humanIndicators = [];
+  if (subScores.energyJitter < 0.4) humanIndicators.push('natural loudness variation');
+  if (subScores.phraseFlat < 0.4) humanIndicators.push('natural phrasing dynamics');
+  if (subScores.fluxStability < 0.4) humanIndicators.push('natural spectral transitions');
+  if (subScores.flux < 0.4) humanIndicators.push('organic spectral change');
+  if (subScores.flatStability < 0.4) humanIndicators.push('stable timbre');
+
+  let details;
+  if (verdict === 'AI') {
+    details = aiIndicators.length > 0 ? aiIndicators.join(', ') : 'Synthetic speech patterns detected';
+  } else {
+    details = humanIndicators.length > 0 ? humanIndicators.join(', ') : 'Authentic speech patterns';
+  }
+
   if (finalScore > 0.25 && finalScore < 0.50) {
     details += ' (low certainty — short or borderline sample)';
   }
